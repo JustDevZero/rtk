@@ -2731,16 +2731,49 @@ const GIT_PUSH_NOISE_PREFIXES: &[&str] = &[
     "Total ",
 ];
 
+// Remote (server-side) progress echoed back during a push — dropped from the stream.
+const GIT_PUSH_REMOTE_NOISE_PREFIXES: &[&str] = &["Resolving deltas:"];
+
 #[derive(Default)]
 struct GitPushLineHandler {
     up_to_date: bool,
     pushed_ref: Option<String>,
+    in_dependabot_notice: bool,
+}
+
+impl GitPushLineHandler {
+    /// GitHub appends a Dependabot alert banner to every push on a repo with open
+    /// alerts. It reports the default branch's standing state, not anything the push
+    /// did, so it is dropped: the summary line, then its indented `.../security/dependabot`
+    /// link.
+    fn is_remote_noise(&mut self, msg: &str) -> bool {
+        let msg_trimmed = msg.trim();
+        if msg_trimmed.is_empty() {
+            return true;
+        }
+        if self.in_dependabot_notice {
+            self.in_dependabot_notice = false;
+            if msg_trimmed.ends_with("/security/dependabot") {
+                return true;
+            }
+        }
+        if msg.starts_with("GitHub found ") && msg.contains(" vulnerabilit") {
+            self.in_dependabot_notice = true;
+            return true;
+        }
+        GIT_PUSH_REMOTE_NOISE_PREFIXES
+            .iter()
+            .any(|p| msg.starts_with(p))
+    }
 }
 
 impl LineHandler for GitPushLineHandler {
     fn should_skip(&mut self, line: &str) -> bool {
         if line.is_empty() {
             return true;
+        }
+        if let Some(msg) = line.strip_prefix("remote:") {
+            return self.is_remote_noise(msg.trim_start());
         }
         let trimmed = line.trim_start();
         GIT_PUSH_NOISE_PREFIXES
@@ -2784,7 +2817,8 @@ fn run_push(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32>
         eprintln!("git push");
     }
 
-    let mut cmd = git_cmd(global_args);
+    // The handler matches git's English progress and "Everything up-to-date" phrases.
+    let mut cmd = git_cmd_c_locale(global_args);
     cmd.arg("push");
     for arg in args {
         cmd.arg(arg);
@@ -2816,7 +2850,8 @@ fn run_pull(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32>
         eprintln!("git pull");
     }
 
-    let mut cmd = git_cmd(global_args);
+    // The summary matches git's English "Already up to date" / "files changed" phrases.
+    let mut cmd = git_cmd_c_locale(global_args);
     cmd.arg("pull");
     for arg in args {
         cmd.arg(arg);
@@ -6649,15 +6684,56 @@ To https://github.com/foo/bar.git
     #[test]
     fn test_push_filter_passes_remote_messages_through() {
         let input = "\
-remote: Resolving deltas: 100% (2/2), completed with 2 local objects.
-remote: GitHub found 1 vulnerability on foo/bar's default branch (1 moderate).
+remote: error: GH006: Protected branch update failed for refs/heads/main.
+remote: Create a pull request for 'feature' on GitHub by visiting:
+remote:      https://github.com/foo/bar/pull/new/feature
 To https://github.com/foo/bar.git
    abc1234..def5678  feature -> feature
 ";
         let result = run_push_filter(input, 0);
-        assert!(result.contains("remote: Resolving deltas"));
-        assert!(result.contains("remote: GitHub found 1 vulnerability"));
+        assert!(result.contains("remote: error: GH006"));
+        assert!(result.contains("remote: Create a pull request"));
+        assert!(result.contains("remote:      https://github.com/foo/bar/pull/new/feature"));
         assert!(result.ends_with("ok feature\n"), "got: {}", result);
+    }
+
+    #[test]
+    fn test_push_filter_drops_dependabot_banner_and_remote_progress() {
+        let input = "\
+Enumerating objects: 7, done.
+Counting objects: 100% (7/7), done.
+Delta compression using up to 16 threads
+Compressing objects: 100% (3/3), done.
+Writing objects: 100% (3/3), 569 bytes | 569.00 KiB/s, done.
+Total 3 (delta 2), reused 0 (delta 0), pack-reused 0 (from 0)
+remote: Resolving deltas: 100% (2/2), completed with 2 local objects.
+remote: 
+remote: GitHub found 49 vulnerabilities on foo/bar's default branch (3 critical, 27 high, 17 moderate, 2 low). To find out more, visit:
+remote:      https://github.com/foo/bar/security/dependabot
+remote: 
+To github.com:foo/bar.git
+   8023489420..f866479bd2  feat/x -> feat/x
+";
+        let result = run_push_filter(input, 0);
+        assert_eq!(
+            result,
+            "To github.com:foo/bar.git\n   8023489420..f866479bd2  feat/x -> feat/x\nok feat/x\n"
+        );
+    }
+
+    #[test]
+    fn test_push_filter_dependabot_skip_only_consumes_its_own_link() {
+        let input = "\
+remote: GitHub found 1 vulnerability on foo/bar's default branch (1 moderate). To find out more, visit:
+remote: Create a pull request for 'feature' on GitHub by visiting:
+";
+        let result = run_push_filter(input, 0);
+        assert!(!result.contains("vulnerability"), "got: {}", result);
+        assert!(
+            result.contains("remote: Create a pull request"),
+            "got: {}",
+            result
+        );
     }
 
     #[test]
